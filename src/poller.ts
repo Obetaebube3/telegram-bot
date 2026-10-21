@@ -188,6 +188,45 @@ export interface PollerCounters {
   eventsSkipped: number;
 }
 
+/**
+ * Per-target summary fields included in the structured `cycle_summary` log entry.
+ *
+ * Stable field names (documented for log consumers and alerts):
+ * - `source`: `"market" | "squad"` — contract target identifier
+ * - `fetched`: number of events returned by the RPC scan for this target in the cycle
+ * - `decoded`: number of fetched events with a known decoded payload (`payload.name !== "unknown"`)
+ * - `sent`: number of notifications delivered to Telegram for this target in the cycle
+ * - `skipped`: number of events skipped for this target in the cycle
+ * - `cursorLedger`: ledger number parsed from the target's cursor at the end of the cycle
+ *   (`null` when no cursor is held or the cursor is opaque; never the raw cursor string)
+ */
+export interface CycleTargetSummary {
+  source: ContractSource;
+  fetched: number;
+  decoded: number;
+  sent: number;
+  skipped: number;
+  cursorLedger: number | null;
+}
+
+/**
+ * Structured JSON fields emitted by `Logger.info("poller", ...)` at the end of each poll cycle.
+ *
+ * Stable field names (documented for log consumers and alerts):
+ * - `action`: always `"cycle_summary"`
+ * - `cycle`: 1-based poll cycle number (`PollerStatus.cycles`)
+ * - `durationMs`: elapsed duration of the cycle in milliseconds
+ * - `targets`: per-target summary keyed by `ContractSource` (`market`, `squad`)
+ * - `suppressed`: number of idle-cycle summary lines suppressed in the previous `LogSampler` window
+ */
+export interface CycleSummaryFields {
+  action: "cycle_summary";
+  cycle: number;
+  durationMs: number;
+  targets: Record<ContractSource, CycleTargetSummary>;
+  suppressed: number;
+}
+
 /** Current on-disk counters schema version. */
 export const COUNTERS_SCHEMA_VERSION = 1 as const;
 
@@ -1307,7 +1346,8 @@ export function createPoller(deps: PollerDeps) {
   };
   const cursorPreview = (cursor: string | null): string => {
     if (cursor === null) return "none";
-    return boundedLabel(cursor, 24);
+    const ledger = eventCursorLedger(cursor);
+    return ledger !== null ? `ledger:${ledger}` : "opaque";
   };
 
   const targets: WatchTarget[] = [
@@ -1695,7 +1735,7 @@ export function createPoller(deps: PollerDeps) {
           cursorFile: config.cursorFile,
           targets: [...state.values()].map((t) => ({
             source: t.source,
-            cursor: t.cursor,
+            cursorLedger: t.cursor ? eventCursorLedger(t.cursor) : null,
             lastEventLedger: t.lastEventLedger,
             rewindFromLedger: t.rewindFromLedger,
           })),
@@ -1955,19 +1995,11 @@ export function createPoller(deps: PollerDeps) {
         );
         // Event name and reason come from remote contract data: bound them so
         // they cannot produce unbounded log output.
-        Logger.info(
-          "poller",
+        console.log(
           `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
             `at ledger ${event.ledger}` +
             (event.payload.reason ? ` (${boundedLabel(event.payload.reason, 160)})` : "") +
             ` correlation=${correlationId}`,
-          {
-            action: "event_skipped",
-            source: event.source,
-            eventName: boundedLabel(event.payload.eventName, 80),
-            ledger: event.ledger,
-            reason: boundedLabel(event.payload.reason ?? "", 160),
-          },
         );
         continue;
       }
@@ -2402,6 +2434,28 @@ export function createPoller(deps: PollerDeps) {
     let cyclePages = 0;
     let cycleEmptyPages = 0;
     let cycleFailures = 0;
+    const cycleTargets: Record<ContractSource, CycleTargetSummary> = {
+      market: {
+        source: "market",
+        fetched: 0,
+        decoded: 0,
+        sent: 0,
+        skipped: 0,
+        cursorLedger: state.get("market")?.cursor
+          ? eventCursorLedger(state.get("market")!.cursor!)
+          : null,
+      },
+      squad: {
+        source: "squad",
+        fetched: 0,
+        decoded: 0,
+        sent: 0,
+        skipped: 0,
+        cursorLedger: state.get("squad")?.cursor
+          ? eventCursorLedger(state.get("squad")!.cursor!)
+          : null,
+      },
+    };
 
     // Drain parked sends before this cycle's events, so a recovered channel
     // catches up in order. Budgeted like the burst below: one recovery must
@@ -2606,6 +2660,19 @@ export function createPoller(deps: PollerDeps) {
           const newest = scan.events[scan.events.length - 1];
           if (newest !== undefined) current.lastEvent = newest;
 
+          const decodedCount = scan.events.reduce(
+            (acc, event) => (event.payload.name !== "unknown" ? acc + 1 : acc),
+            0,
+          );
+          cycleTargets[target.source] = {
+            source: target.source,
+            fetched: scan.events.length,
+            decoded: decodedCount,
+            sent: delivery.sent,
+            skipped: delivery.skipped,
+            cursorLedger: current.cursor ? eventCursorLedger(current.cursor) : null,
+          };
+
           trackCursorAdvance(current, previousCursor, scan.latestLedger);
         } catch (err) {
           cycleFailures++;
@@ -2647,6 +2714,10 @@ export function createPoller(deps: PollerDeps) {
             await rewindFromRetainedFloor(target, current);
           }
 
+          cycleTargets[target.source].cursorLedger = current.cursor
+            ? eventCursorLedger(current.cursor)
+            : null;
+
           const retryAfterMs = extractRetryAfterMs(err);
           if (retryAfterMs !== null) {
             console.warn(`[poller] RPC requested backoff for ${retryAfterMs}ms`);
@@ -2687,6 +2758,33 @@ export function createPoller(deps: PollerDeps) {
         status.consecutiveFailures += 1;
         metrics?.consecutiveFailures.set(status.consecutiveFailures);
         emitCircuitBreakerWarning();
+      }
+
+      const durationMs = Math.max(0, now() - currentTime);
+      const isIdleCycle =
+        cycleFailures === 0 &&
+        Object.values(cycleTargets).every(
+          (t) => t.fetched === 0 && t.decoded === 0 && t.sent === 0 && t.skipped === 0,
+        );
+      const sample = isIdleCycle ? errorSampler.record("cycle:idle") : { log: true, suppressed: 0 };
+      if (sample.log) {
+        const m = cycleTargets.market;
+        const s = cycleTargets.squad;
+        const summaryFields: CycleSummaryFields = {
+          action: "cycle_summary",
+          cycle: status.cycles,
+          durationMs,
+          targets: cycleTargets,
+          suppressed: sample.suppressed,
+        };
+        Logger.info(
+          "poller",
+          `[poller] cycle #${status.cycles} in ${durationMs}ms ` +
+            `market(fetched=${m.fetched} decoded=${m.decoded} sent=${m.sent} skipped=${m.skipped} cursorLedger=${m.cursorLedger ?? "none"}) ` +
+            `squad(fetched=${s.fetched} decoded=${s.decoded} sent=${s.sent} skipped=${s.skipped} cursorLedger=${s.cursorLedger ?? "none"})` +
+            formatSuppressedRepeats(sample.suppressed, errorSampler.windowMs),
+          summaryFields as unknown as Record<string, unknown>,
+        );
       }
     } finally {
       // The write and the tracking promise are what a shutdown waits for, so
