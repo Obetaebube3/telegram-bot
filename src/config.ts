@@ -1014,7 +1014,7 @@ export interface ConfigProvenance {
   warnings: string[];
 }
 
-interface ConfigKeySpec {
+export interface ConfigKeySpec {
   key: string;
   /** The value must never reach a log line, a health response, or an error. */
   secret: boolean;
@@ -1029,10 +1029,13 @@ interface ConfigKeySpec {
  * report that lists keys the process never reads would be noise, and one that
  * omits a key it does read would be a lie.
  */
-const CONFIG_KEYS: readonly ConfigKeySpec[] = [
+export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "MIMIR_PROFILE", secret: false },
   { key: "MARKET_CONTRACT_ID", secret: false },
   { key: "SQUAD_CONTRACT_ID", secret: false },
+  { key: "MARKET_CONTRACT_VERSION", secret: false, hasBuiltInDefault: true },
+  { key: "SQUAD_CONTRACT_VERSION", secret: false, hasBuiltInDefault: true },
+  { key: "STELLAR_NETWORK", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_RPC_URL", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_HORIZON_URL", secret: false, hasBuiltInDefault: true },
   { key: "STELLAR_NETWORK_PASSPHRASE", secret: false, hasBuiltInDefault: true },
@@ -1051,9 +1054,18 @@ const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "INSTANCE_LOCK_FILE", secret: false, hasBuiltInDefault: true },
   { key: "STATUS_FILE", secret: false, hasBuiltInDefault: true },
   { key: "MAX_NOTIFICATIONS_PER_CYCLE", secret: false, hasBuiltInDefault: true },
+  { key: "INTER_SEND_DELAY_MS", secret: false, hasBuiltInDefault: true },
+  { key: "METRICS_PORT", secret: false },
+  { key: "NOTIFY_ENABLED", secret: false, hasBuiltInDefault: true },
+  { key: "NOTIFY_MARKET", secret: false, hasBuiltInDefault: true },
+  { key: "NOTIFY_SQUAD", secret: false, hasBuiltInDefault: true },
+  { key: "SILENT_EVENTS", secret: false, hasBuiltInDefault: true },
   { key: "AUDIT_FILE", secret: false, hasBuiltInDefault: true },
   { key: "SEND_JOURNAL_FILE", secret: false, hasBuiltInDefault: true },
   { key: "EVENT_DEDUP_WINDOW", secret: false, hasBuiltInDefault: true },
+  { key: "DEAD_LETTER_FILE", secret: false, hasBuiltInDefault: true },
+  { key: "DEAD_LETTER_MAX", secret: false, hasBuiltInDefault: true },
+  { key: "DEAD_LETTER_MAX_ATTEMPTS", secret: false, hasBuiltInDefault: true },
   { key: "HEALTH_HOST", secret: false, hasBuiltInDefault: true },
   {
     key: "HEALTH_PORT",
@@ -1070,11 +1082,15 @@ const CONFIG_KEYS: readonly ConfigKeySpec[] = [
     },
   },
   { key: "HEALTH_STALE_MS", secret: false, hasBuiltInDefault: true },
+  { key: "STARTUP_HEALTH_DEADLINE_MS", secret: false, hasBuiltInDefault: true },
+  { key: "STARTUP_HEALTH_RETRY_MS", secret: false, hasBuiltInDefault: true },
   { key: "SHUTDOWN_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
   { key: "TELEGRAM_SEND_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },
   { key: "CHANNEL_PREVIEW_MODE", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_MARKET", secret: false, hasBuiltInDefault: true },
   { key: "LINK_PREVIEW_SQUAD", secret: false, hasBuiltInDefault: true },
+  { key: "LOG_SAMPLE_MAX_PER_WINDOW", secret: false, hasBuiltInDefault: true },
+  { key: "LOG_SAMPLE_WINDOW_MS", secret: false, hasBuiltInDefault: true },
   { key: "TELEGRAM_API_ROOT", secret: false },
   { key: "MIMIR_APP_URL", secret: false },
   // Injected by a platform, never set by an operator: read only as the
