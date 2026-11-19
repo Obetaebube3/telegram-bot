@@ -10,6 +10,8 @@
  *     USDC amounts with optional USDC suffix (e.g. 100 USDC or $100 or 100), and booleans (true, false).
  *   - Pure evaluation over DecodedEvent without eval or dynamic code execution.
  *   - Static field validation and type compatibility checking against known payload types.
+ *   - Bounded token count (max 100 tokens) and nesting depth (max 10) to guard against
+ *     hostile allocation spikes or recursion depth exhaustion before and during parsing.
  */
 
 import type { DecodedEvent } from "../stellar/decode.js";
@@ -157,6 +159,40 @@ export const EVENT_PAYLOAD_SCHEMAS: Record<string, Record<string, FieldDefinitio
     admin: { type: "string" },
   },
 };
+
+/** Maximum allowed non-EOF tokens in a single filter expression before parsing. */
+export const MAX_FILTER_TOKENS = 100;
+
+/** Maximum allowed nesting depth for parentheses in filter expressions. */
+export const MAX_FILTER_DEPTH = 10;
+
+/** Error thrown when a filter expression exceeds the maximum allowed token count. */
+export class FilterTokenLimitError extends Error {
+  public readonly count: number;
+  public readonly limit: number;
+
+  constructor(count: number, limit: number = MAX_FILTER_TOKENS) {
+    super(`Filter expression exceeds maximum token limit of ${limit} (got ${count})`);
+    this.name = "FilterTokenLimitError";
+    this.count = count;
+    this.limit = limit;
+  }
+}
+
+/** Error thrown when a filter expression exceeds the maximum allowed nesting depth. */
+export class FilterDepthLimitError extends Error {
+  public readonly depth: number;
+  public readonly limit: number;
+  public readonly position: number;
+
+  constructor(depth: number, limit: number = MAX_FILTER_DEPTH, position = 0) {
+    super(`At character ${position}: Filter expression exceeds maximum nesting depth of ${limit} (depth ${depth})`);
+    this.name = "FilterDepthLimitError";
+    this.depth = depth;
+    this.limit = limit;
+    this.position = position;
+  }
+}
 
 /** Parse / Validation Error with character position. */
 export class FilterParseError extends Error {
@@ -446,6 +482,45 @@ export function parseUsdcStringToUnits(numStr: string, pos = 0): bigint {
   return whole * USDC_SCALE + frac;
 }
 
+/**
+ * Options for configuring filter expression parsing.
+ */
+export interface FilterParserOptions {
+  /**
+   * Maximum allowed non-EOF tokens in the expression.
+   * Defaults to {@link MAX_FILTER_TOKENS} (100).
+   */
+  maxTokens?: number;
+  /**
+   * Maximum allowed nesting depth for parentheses.
+   * Defaults to {@link MAX_FILTER_DEPTH} (10).
+   */
+  maxDepth?: number;
+}
+
+/**
+ * Counts the tokens in a filter expression by running a streaming lexer pass
+ * without allocating an AST or holding an array of tokens.
+ *
+ * @throws {@link FilterTokenLimitError} if token count exceeds maxTokens.
+ * @throws {@link FilterParseError} on lexical syntax errors.
+ */
+export function countFilterTokens(input: string, maxTokens: number = MAX_FILTER_TOKENS): number {
+  const lexer = new Lexer(input);
+  let count = 0;
+  while (true) {
+    const token = lexer.nextToken();
+    if (token.type === "EOF") {
+      break;
+    }
+    count++;
+    if (count > maxTokens) {
+      throw new FilterTokenLimitError(count, maxTokens);
+    }
+  }
+  return count;
+}
+
 // ----------------------------------------------------
 // Parser
 // ----------------------------------------------------
@@ -453,14 +528,30 @@ export function parseUsdcStringToUnits(numStr: string, pos = 0): bigint {
 export class FilterParser {
   private lexer: Lexer;
   private currentToken: Token;
+  private tokenCount = 0;
+  private currentDepth = 0;
+  private readonly maxTokens: number;
+  private readonly maxDepth: number;
 
-  constructor(input: string) {
+  constructor(input: string, options?: FilterParserOptions) {
+    this.maxTokens = options?.maxTokens ?? MAX_FILTER_TOKENS;
+    this.maxDepth = options?.maxDepth ?? MAX_FILTER_DEPTH;
+
+    // Bound token count upfront to reject excessive tokens and avoid deep recursion/allocation spikes
+    countFilterTokens(input, this.maxTokens);
+
     this.lexer = new Lexer(input);
-    this.currentToken = this.lexer.nextToken();
+    this.currentToken = this.advance();
   }
 
   private advance(): Token {
     this.currentToken = this.lexer.nextToken();
+    if (this.currentToken.type !== "EOF") {
+      this.tokenCount++;
+      if (this.tokenCount > this.maxTokens) {
+        throw new FilterTokenLimitError(this.tokenCount, this.maxTokens);
+      }
+    }
     return this.currentToken;
   }
 
@@ -549,11 +640,17 @@ export class FilterParser {
 
   private parsePrimary(): ExprNode {
     if (this.currentToken.type === "LPAREN") {
+      const parenPos = this.currentToken.pos;
+      this.currentDepth++;
+      if (this.currentDepth > this.maxDepth) {
+        throw new FilterDepthLimitError(this.currentDepth, this.maxDepth, parenPos);
+      }
       this.advance();
       const expr = this.parseExpression();
       if ((this.currentToken.type as TokenType) !== "RPAREN") {
         throw new FilterParseError("Expected closing ')'", this.currentToken.pos);
       }
+      this.currentDepth--;
       this.advance();
       return expr;
     }
@@ -712,11 +809,17 @@ export function validateConditionAgainstSchema(condition: ExprNode, eventName: s
 
 /**
  * Parses a filter expression string into a structured {@link FilterRule}.
+ * Bounds token count and nesting depth upfront to prevent allocation spikes
+ * or deep recursion on hostile input.
  *
+ * @param input The raw filter expression string.
+ * @param options Optional limits on tokens ({@link MAX_FILTER_TOKENS}) and depth ({@link MAX_FILTER_DEPTH}).
+ * @throws {@link FilterTokenLimitError} if token count exceeds maxTokens.
+ * @throws {@link FilterDepthLimitError} if parentheses nesting depth exceeds maxDepth.
  * @throws {@link FilterParseError} on invalid syntax, unknown fields, or type mismatches.
  */
-export function parseFilterExpression(input: string): FilterRule {
-  const parser = new FilterParser(input.trim());
+export function parseFilterExpression(input: string, options?: FilterParserOptions): FilterRule {
+  const parser = new FilterParser(input.trim(), options);
   return parser.parseRule(input);
 }
 
